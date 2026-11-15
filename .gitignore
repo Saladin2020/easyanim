@@ -1,0 +1,16 @@
+node_modules/
+dist/
+web/dist/
+.scratch/
+# workspace data when the repo itself is used as the workspace
+/cutscenes/
+/sprites/
+/previews/
+/exports/
+/easyanim.config.json
+*.log
+.DS_Store
+.env
+.env.*
+.cursor/
+*.local.json

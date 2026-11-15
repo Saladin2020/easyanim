@@ -1,0 +1,441 @@
+import { copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { summary } from "../shared/cutscene.js";
+import { evaluate } from "../shared/evaluate.js";
+import { FRAME, FRAME_COLUMNS, SIDE_ROWS } from "../shared/sprites.js";
+import { EXPORT_PRESETS, type Cutscene, type ExportPreset } from "../shared/types.js";
+import { FONT_DIR, RUNTIME_DIR } from "./assets.js";
+import { contactSheet, ffmpegPath, renderVideo } from "./render.js";
+import { backdropPng, sheetsFor, type SheetInfo } from "./sheets.js";
+import { dirs, listCutscenes, loadConfig, loadCutscene, resolveInside } from "./workspace.js";
+
+export { EXPORT_PRESETS };
+export const VERSION = "0.1.0";
+
+export interface ExportOptions {
+  preset?: ExportPreset;
+  ids?: string[];
+  tags?: string[];
+  out?: string;
+  /** video preset: frames per second and integer scale. */
+  fps?: number;
+  scale?: number;
+  trustedPaths?: boolean;
+}
+
+export interface ExportResult {
+  dirs: string[];
+  files: string[];
+  cutscenes: string[];
+  warnings: string[];
+  placeholders: string[];
+}
+
+class Writer {
+  files: string[] = [];
+  constructor(readonly dir: string) {}
+  async write(rel: string, body: string | Buffer) {
+    const f = path.join(this.dir, rel);
+    await mkdir(path.dirname(f), { recursive: true });
+    await writeFile(f, body);
+    this.files.push(f);
+    return f;
+  }
+  async copy(src: string, rel: string) {
+    const f = path.join(this.dir, rel);
+    await mkdir(path.dirname(f), { recursive: true });
+    await copyFile(src, f);
+    this.files.push(f);
+  }
+}
+
+interface Bundle {
+  cs: Cutscene;
+  sheets: Map<string, SheetInfo>;
+  backdrop: Buffer;
+}
+
+async function bundles(root: string, list: Cutscene[]): Promise<Bundle[]> {
+  return Promise.all(list.map(async (cs) => ({ cs, sheets: await sheetsFor(root, cs), backdrop: await backdropPng(root, cs) })));
+}
+
+/** Normalized cutscene + asset paths relative to `cutscenes/<id>.json`. */
+function withAssets(cs: Cutscene) {
+  const sprites: Record<string, string> = {};
+  for (const a of cs.actors) sprites[a.sprite] = `../sprites/${a.sprite}.png`;
+  return { ...cs, generator: `easyanim ${VERSION}`, assets: { backdrop: `../backdrops/${cs.id}.png`, sprites } };
+}
+
+const json = (v: unknown) => `${JSON.stringify(v, null, 2)}\n`;
+
+// ------------------------------------------------------------------ godot
+
+function spriteFramesTres(sprite: string): string {
+  const subs: string[] = [];
+  const anims: string[] = [];
+  SIDE_ROWS.forEach((face, r) => {
+    const frames: string[] = [];
+    FRAME_COLUMNS.forEach((_, c) => {
+      const id = `a_${r}_${c}`;
+      subs.push(`[sub_resource type="AtlasTexture" id="${id}"]\natlas = ExtResource("1")\nregion = Rect2(${c * FRAME}, ${r * FRAME}, ${FRAME}, ${FRAME})\n`);
+      frames.push(`{\n"duration": 1.0,\n"texture": SubResource("${id}")\n}`);
+    });
+    anims.push(`{\n"frames": [${frames.join(", ")}],\n"loop": true,\n"name": &"${face}",\n"speed": 1.0\n}`);
+  });
+  return `[gd_resource type="SpriteFrames" load_steps=${subs.length + 2} format=3]
+
+[ext_resource type="Texture2D" path="res://easyanim/sprites/${sprite}.png" id="1"]
+
+${subs.join("\n")}
+[resource]
+animations = [${anims.join(", ")}]
+`;
+}
+
+function cutsceneTscn(cs: Cutscene): string {
+  const sprites = [...new Set(cs.actors.map((a) => a.sprite))];
+  const ext = [
+    `[ext_resource type="Script" path="res://easyanim/cutscene_runner.gd" id="1"]`,
+    `[ext_resource type="Texture2D" path="res://easyanim/backdrops/${cs.id}.png" id="2"]`,
+    ...sprites.map((s, i) => `[ext_resource type="SpriteFrames" path="res://easyanim/sprites/${s}.tres" id="s${i}"]`),
+  ];
+  const nodeName = cs.id.replace(/(^|_)([a-z0-9])/g, (_, __, c: string) => c.toUpperCase());
+  const s0 = evaluate(cs, 0);
+  const actors = cs.actors.map((a) => {
+    const st = s0.actors.find((x) => x.id === a.id)!;
+    return `[node name="${a.id}" type="AnimatedSprite2D" parent="Actors"]
+${st.visible ? "" : "visible = false\n"}position = Vector2(${Math.round(st.x)}, ${Math.round(st.y)})
+sprite_frames = ExtResource("s${sprites.indexOf(a.sprite)}")
+animation = &"${st.face}"
+frame = ${Math.max(0, (FRAME_COLUMNS as readonly string[]).indexOf(st.frame))}
+centered = false
+offset = Vector2(-24, -47)
+`;
+  });
+  return `[gd_scene load_steps=${ext.length + 1} format=3]
+
+${ext.join("\n")}
+
+[node name="${nodeName}" type="Node2D"]
+script = ExtResource("1")
+cutscene_path = "res://easyanim/cutscenes/${cs.id}.json"
+
+[node name="Backdrop" type="Sprite2D" parent="."]
+texture = ExtResource("2")
+centered = false
+
+[node name="Actors" type="Node2D" parent="."]
+
+${actors.join("\n")}
+[node name="Camera" type="Camera2D" parent="."]
+position = Vector2(${s0.camera.x}, ${s0.camera.y})
+`;
+}
+
+const GODOT_MAIN = `extends Node
+## Easy Anim demo: plays every exported cutscene in turn. Space / Enter continues at wait_input.
+## Generated by Easy Anim.
+
+var ids: Array = []
+var index := 0
+var current: Node
+
+
+func _ready() -> void:
+	var f := FileAccess.open("res://easyanim/cutscenes.json", FileAccess.READ)
+	ids = JSON.parse_string(f.get_as_text())["ids"]
+	_play()
+
+
+func _play() -> void:
+	if current:
+		current.queue_free()
+	current = load("res://easyanim/scenes/%s.tscn" % ids[index]).instantiate()
+	current.finished.connect(_next)
+	add_child(current)
+
+
+func _next() -> void:
+	index = (index + 1) % ids.size()
+	_play()
+`;
+
+const GODOT_TEST = `extends SceneTree
+## Headless check for an Easy Anim export: every cutscene scene loads, its runner evaluates the parity times
+## from easyanim/parity.json (printed as "P|" lines, compared with the TypeScript by the Easy Anim test suite),
+## and a few seconds of real playback run without errors. Ends with "EASYANIM OK".
+
+func _f(v) -> String:
+	return "%.3f" % float(v)
+
+
+func _initialize() -> void:
+	# root's children enter the tree on the first frame, so run from a deferred call
+	_run.call_deferred()
+
+
+func _run() -> void:
+	var f := FileAccess.open("res://easyanim/parity.json", FileAccess.READ)
+	var parity: Dictionary = JSON.parse_string(f.get_as_text())
+	var ok := true
+	for id in parity.keys():
+		var scene: PackedScene = load("res://easyanim/scenes/%s.tscn" % id)
+		if scene == null:
+			print("FAIL scene ", id)
+			ok = false
+			continue
+		var cs = scene.instantiate()
+		cs.autoplay = false
+		root.add_child(cs)
+		if cs.data.is_empty():
+			print("FAIL data ", id)
+			ok = false
+			continue
+		for t in parity[id]:
+			var s: Dictionary = cs.state_at(float(t))
+			var parts := []
+			for a in s["actors"]:
+				parts.append("%s,%s,%s,%s,%s,%s" % [a["id"], _f(a["x"]), _f(a["y"]), a["face"], a["frame"], "1" if a["visible"] else "0"])
+			var c: Dictionary = s["camera"]
+			var line = s["line"]
+			var fx := []
+			for e in s["fx"]:
+				fx.append("%d:%s:%s" % [int(e["i"]), _f(e["x"]), _f(e["y"])])
+			print("P|%s|%s|%s|%s,%s,%s,%s,%s|%s,%s|%s|%s|%s" % [id, _f(t), ";".join(parts), _f(c["x"]), _f(c["y"]), _f(c["zoom"]), _f(c["sx"]), _f(c["sy"]), _f(s["fade"]["a"]), s["fade"]["color"], ("%d:%d" % [int(line["i"]), int(line["shown"])]) if line != null else "-", ";".join(fx), s["music"] if s["music"] != null else "-"])
+		# real playback: fire cues, drive the nodes
+		var cues := {"music": 0, "line": 0, "fx": 0}
+		cs.music.connect(func(_id, _fade): cues["music"] += 1)
+		cs.line_shown.connect(func(_s, _t, _r): cues["line"] += 1)
+		cs.fx_spawned.connect(func(_id, _p): cues["fx"] += 1)
+		cs.auto_advance = true
+		cs.seek(0.0)
+		cs.play()
+		var steps := int(ceil(cs.duration() / 0.25)) + 2
+		for i in steps:
+			cs._process(0.25)
+		var actors_node: Node = cs.get_node("Actors")
+		print("R|%s|duration=%s|actors=%d|music=%d|lines=%d|fx=%d|finished=%s" % [id, _f(cs.duration()), actors_node.get_child_count(), cues["music"], cues["line"], cues["fx"], str(not cs.playing)])
+		if cues["line"] == 0 or cs.playing or not cs.is_inside_tree():
+			ok = false
+		cs.queue_free()
+	print("EASYANIM OK" if ok else "EASYANIM FAIL")
+	quit(0 if ok else 1)
+`;
+
+/** Times the Godot test evaluates for parity (also used by the test suite). */
+export function parityTimes(cs: Cutscene): number[] {
+  const ts = new Set<number>([0]);
+  for (let t = 0.137; t < cs.duration; t += 0.73) ts.add(Math.round(t * 1000) / 1000);
+  for (const e of cs.events) {
+    ts.add(Math.round((e.t + Math.min(e.dur, 0.5) * 0.5) * 1000) / 1000);
+    if (e.dur > 0) ts.add(Math.round((e.t + e.dur + 0.01) * 1000) / 1000);
+  }
+  ts.add(cs.duration);
+  return [...ts].filter((t) => t >= 0 && t <= cs.duration).sort((a, b) => a - b);
+}
+
+async function exportGodot(w: Writer, list: Bundle[]) {
+  const name = list.length === 1 ? list[0]!.cs.en : "Easy Anim cutscenes";
+  const first = list[0]!.cs;
+  await w.write(
+    "project.godot",
+    `; Engine configuration file. Generated by Easy Anim ${VERSION}.
+config_version=5
+
+[application]
+
+config/name="${name.replace(/"/g, "'")}"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.3")
+
+[display]
+
+window/size/viewport_width=${first.stage.width}
+window/size/viewport_height=${first.stage.height}
+window/size/window_width_override=${first.stage.width * 3}
+window/size/window_height_override=${first.stage.height * 3}
+window/stretch/mode="viewport"
+window/stretch/scale_mode="integer"
+
+[rendering]
+
+textures/canvas_textures/default_texture_filter=0
+renderer/rendering_method="gl_compatibility"
+`,
+  );
+  await w.copy(path.join(RUNTIME_DIR, "godot", "cutscene_runner.gd"), "easyanim/cutscene_runner.gd");
+  await w.copy(path.join(FONT_DIR, "Kanit-Regular.ttf"), "easyanim/fonts/Kanit-Regular.ttf");
+  await w.copy(path.join(FONT_DIR, "OFL.txt"), "easyanim/fonts/OFL.txt");
+  const written = new Set<string>();
+  const parity: Record<string, number[]> = {};
+  for (const b of list) {
+    await w.write(`easyanim/cutscenes/${b.cs.id}.json`, json(withAssets(b.cs)));
+    await w.write(`easyanim/backdrops/${b.cs.id}.png`, b.backdrop);
+    for (const [sprite, s] of b.sheets) {
+      if (written.has(sprite)) continue;
+      written.add(sprite);
+      await w.write(`easyanim/sprites/${sprite}.png`, s.png);
+      await w.write(`easyanim/sprites/${sprite}.tres`, spriteFramesTres(sprite));
+    }
+    await w.write(`easyanim/scenes/${b.cs.id}.tscn`, cutsceneTscn(b.cs));
+    parity[b.cs.id] = parityTimes(b.cs);
+  }
+  await w.write("easyanim/cutscenes.json", json({ ids: list.map((b) => b.cs.id) }));
+  await w.write("easyanim/parity.json", json(parity));
+  await w.write("main.gd", GODOT_MAIN);
+  await w.write("main.tscn", `[gd_scene load_steps=2 format=3]\n\n[ext_resource type="Script" path="res://main.gd" id="1"]\n\n[node name="Main" type="Node"]\nscript = ExtResource("1")\n`);
+  await w.write("test_anim.gd", GODOT_TEST);
+  await w.write(
+    "README.txt",
+    `Easy Anim Godot 4.3+ export
+
+  easyanim/cutscene_runner.gd    class EasyAnimCutscene (Node2D): play / pause / seek / advance, signals
+  easyanim/scenes/<id>.tscn      ready cutscene scenes (backdrop, AnimatedSprite2D actors, Camera2D)
+  easyanim/sprites/<sprite>.tres SpriteFrames: animations right / left / front, frame = sheet column
+  easyanim/cutscenes/<id>.json   normalized timelines (keep *.json in your export filter)
+  main.tscn                      plays every cutscene in turn; Space / Enter continues at wait_input
+
+  var cs = preload("res://easyanim/scenes/${first.id}.tscn").instantiate()
+  add_child(cs)
+  await cs.finished
+
+Hooks: res://easyfx/scenes/<id>.tscn (Easy FX), /root/MusicPlayer (Easy Music), /root/SfxBank (Easy SFX).
+Headless check: godot --headless --path . --script res://test_anim.gd
+`,
+  );
+}
+
+// ------------------------------------------------------------------ pixi
+
+const PIXI_HTML = (ids: string[]) => `<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<title>Easy Anim · PixiJS v8 cutscene demo</title>
+<link rel="icon" href="data:,">
+<style>
+  body { margin: 0; background: #140e0a; color: #f7ebd3; font: 14px Kanit, system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 16px; }
+  canvas { image-rendering: pixelated; border: 2px solid #f4ae3d; }
+  button { background: #2e2014; color: #f7ebd3; border: 1px solid #f4ae3d; padding: 4px 10px; font: inherit; cursor: pointer; }
+  #bar { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+  input[type=range] { width: 640px; }
+</style>
+</head>
+<body>
+<div id="bar">${ids.map((id) => `<button data-id="${id}">${id}</button>`).join("")}</div>
+<div id="stage"></div>
+<div id="bar"><button id="play">▶ / ❚❚</button><button id="next">continue (wait_input)</button><span id="clock">0.0 s</span></div>
+<input id="scrub" type="range" min="0" max="1000" value="0">
+<script type="module">
+  async function pixi() {
+    try { const r = await fetch("./pixi.min.js", { method: "HEAD" }); if (r.ok) { await import("./pixi.min.js"); return window.PIXI; } } catch {}
+    return await import("https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.min.mjs");
+  }
+  const PIXI = await pixi();
+  const { loadCutscene } = await import("./easyanim-pixi.js");
+  const SCALE = 3;
+  const app = new PIXI.Application();
+  await app.init({ width: 320 * SCALE, height: 180 * SCALE, background: "#140e0a", antialias: false, roundPixels: true });
+  document.getElementById("stage").appendChild(app.canvas);
+  let cs = null;
+  const scrub = document.getElementById("scrub");
+  async function open(id) {
+    if (cs) { app.stage.removeChild(cs.view); cs.view.destroy({ children: true }); }
+    cs = await loadCutscene(PIXI, "cutscenes/" + id + ".json");
+    cs.view.scale.set(SCALE);
+    app.stage.addChild(cs.view);
+    cs.on("line", (l) => window.__anim.lines.push(l.i));
+    cs.on("music", (m) => window.__anim.music.push(m));
+    cs.on("fx", (f) => window.__anim.fx.push(f));
+    window.__anim.cs = cs;
+    cs.play();
+  }
+  window.__anim = { open, lines: [], music: [], fx: [], cs: null };
+  app.ticker.add((tk) => {
+    if (!cs) return;
+    cs.update(tk.deltaMS / 1000);
+    scrub.value = String(Math.round((cs.time / cs.duration) * 1000));
+    document.getElementById("clock").textContent = cs.time.toFixed(1) + " / " + cs.duration.toFixed(1) + " s" + (cs.waiting ? " · waiting" : "");
+  });
+  scrub.addEventListener("input", () => cs && cs.seek((Number(scrub.value) / 1000) * cs.duration));
+  document.getElementById("play").onclick = () => cs && (cs.playing ? cs.pause() : cs.play());
+  document.getElementById("next").onclick = () => cs && cs.advance();
+  document.querySelectorAll("button[data-id]").forEach((b) => (b.onclick = () => open(b.dataset.id)));
+  await open(${JSON.stringify(ids[0])});
+  window.__ready = true;
+</script>
+</body>
+</html>
+`;
+
+async function exportPixi(w: Writer, list: Bundle[]) {
+  await w.copy(path.join(RUNTIME_DIR, "web", "easyanim-core.js"), "easyanim-core.js");
+  await w.copy(path.join(RUNTIME_DIR, "web", "easyanim-pixi.js"), "easyanim-pixi.js");
+  const written = new Set<string>();
+  for (const b of list) {
+    await w.write(`cutscenes/${b.cs.id}.json`, json(withAssets(b.cs)));
+    await w.write(`backdrops/${b.cs.id}.png`, b.backdrop);
+    for (const [sprite, s] of b.sheets) {
+      if (written.has(sprite)) continue;
+      written.add(sprite);
+      await w.write(`sprites/${sprite}.png`, s.png);
+    }
+  }
+  await w.write("easyanim.json", json({ generator: `easyanim ${VERSION}`, cutscenes: list.map((b) => ({ ...summary(b.cs), file: `cutscenes/${b.cs.id}.json` })) }));
+  await w.write("index.html", PIXI_HTML(list.map((b) => b.cs.id)));
+}
+
+// ------------------------------------------------------------------ video / json
+
+async function exportVideo(root: string, w: Writer, list: Bundle[], opts: ExportOptions, warnings: string[]) {
+  const cfg = await loadConfig(root);
+  const ff = ffmpegPath();
+  for (const b of list) {
+    await w.write(`${b.cs.id}-contact.png`, await contactSheet(root, b.cs, { count: 8, cols: 4, scale: 1 }));
+    if (!ff) continue;
+    for (const ext of [".gif", ".mp4"]) {
+      const f = path.join(w.dir, `${b.cs.id}${ext}`);
+      await renderVideo(root, b.cs, f, { fps: opts.fps ?? cfg.fps, scale: ext === ".gif" ? 1 : (opts.scale ?? cfg.scale) });
+      w.files.push(f);
+    }
+  }
+  if (!ff) warnings.push("ffmpeg not found: wrote contact sheets only (GIF / MP4 need ffmpeg)");
+}
+
+async function exportJson(w: Writer, list: Bundle[]) {
+  for (const b of list) await w.write(`cutscenes/${b.cs.id}.json`, json(withAssets(b.cs)));
+  await w.write("easyanim.json", json({ generator: `easyanim ${VERSION}`, cutscenes: list.map((b) => summary(b.cs)) }));
+}
+
+export async function exportCutscenes(root: string, opts: ExportOptions = {}): Promise<ExportResult> {
+  const preset = opts.preset ?? "all";
+  if (!(EXPORT_PRESETS as readonly string[]).includes(preset)) throw new Error(`Unknown preset ${preset} (use ${EXPORT_PRESETS.join(", ")})`);
+  if (preset === "all" && opts.out) throw new Error("--out needs a single preset (all writes exports/easyanim-<preset>/)");
+  let list: Cutscene[];
+  const warnings: string[] = [];
+  if (opts.ids?.length) list = await Promise.all(opts.ids.map(async (id) => (await loadCutscene(root, id)).cutscene));
+  else {
+    const all = await listCutscenes(root);
+    for (const b of all.broken) warnings.push(`skipped ${b.id}: ${b.errors[0]?.path} ${b.errors[0]?.message}`);
+    list = all.cutscenes.map((c) => c.cutscene);
+  }
+  if (opts.tags?.length) list = list.filter((c) => opts.tags!.some((t) => c.tags.includes(t)));
+  if (!list.length) throw new Error("No cutscenes to export");
+  const b = await bundles(root, list);
+  const placeholders = [...new Set(b.flatMap((x) => [...x.sheets.values()].filter((s) => s.placeholder).map((s) => s.sprite)))];
+  if (placeholders.length) warnings.push(`placeholder sheets (no sprites/<id>.png in the workspace): ${placeholders.join(", ")}`);
+  const presets = preset === "all" ? (["godot", "pixi", "video", "json"] as const) : [preset];
+  const result: ExportResult = { dirs: [], files: [], cutscenes: list.map((c) => c.id), warnings, placeholders };
+  for (const p of presets) {
+    const dir = opts.out ? (opts.trustedPaths ? path.resolve(root, opts.out) : resolveInside(root, opts.out)) : path.join(dirs(root).exports, `easyanim-${p}`);
+    if (!opts.out) await rm(dir, { recursive: true, force: true });
+    const w = new Writer(dir);
+    if (p === "godot") await exportGodot(w, b);
+    else if (p === "pixi") await exportPixi(w, b);
+    else if (p === "video") await exportVideo(root, w, b, opts, warnings);
+    else await exportJson(w, b);
+    result.dirs.push(dir);
+    result.files.push(...w.files);
+  }
+  return result;
+}

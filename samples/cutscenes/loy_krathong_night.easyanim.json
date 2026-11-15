@@ -1,0 +1,43 @@
+{
+  "format": "easyanim/1",
+  "th": "คืนลอยกระทงริมคลอง",
+  "en": "Loy Krathong night by the river",
+  "tags": ["festival", "loy_krathong", "night"],
+  "lang": "th",
+  "stage": { "width": 320, "height": 180, "worldWidth": 480, "backdrop": "river_night", "ground": 158, "camera": { "x": 160, "y": 90, "zoom": 1 } },
+  "actors": [
+    { "id": "fon", "sprite": "side_school_girl", "name": { "th": "ฝน", "en": "Fon" }, "x": -20, "face": "right" },
+    { "id": "ton", "sprite": "side_little_boy", "name": { "th": "ต้น", "en": "Ton" }, "x": -44, "face": "right" },
+    { "id": "pak_hamid", "sprite": "side_pelekat_fisher", "name": { "th": "ปะหมิด", "en": "Pak Hamid" }, "x": 520, "face": "left" }
+  ],
+  "events": [
+    { "t": 0, "track": "screen", "op": "fade", "to": 1, "dur": 0 },
+    { "t": 0, "track": "screen", "op": "fade", "to": 0, "dur": 2 },
+    { "t": 0, "track": "audio", "op": "music", "music": "loy_krathong", "fade": 3 },
+    { "t": 0, "track": "fx", "op": "spawn", "fx": "fireflies", "at": [90, 130], "dur": 32 },
+    { "t": 0.5, "track": "actor", "op": "move", "actor": "fon", "to": [200, 158], "dur": 5 },
+    { "t": 0.5, "track": "actor", "op": "move", "actor": "ton", "to": [176, 158], "dur": 5 },
+    { "t": 1.0, "track": "camera", "op": "pan", "to": [220, 90], "dur": 4.5 },
+    { "t": 6.0, "track": "dialogue", "op": "line", "speaker": "fon", "th": "ปีนี้ลอยกระทงด้วยกันนะต้น", "en": "Let's float our krathong together this year, Ton." },
+    { "t": 8.8, "track": "dialogue", "op": "line", "speaker": "ton", "th": "ผมทำกระทงใบตองเองเลยนะพี่ฝน", "en": "I made mine from banana leaves myself, Fon!" },
+    { "t": 8.8, "track": "actor", "op": "anim", "actor": "ton", "anim": "cheer", "dur": 1 },
+    { "t": 11.4, "track": "actor", "op": "move", "actor": "pak_hamid", "to": [262, 158], "dur": 4 },
+    { "t": 15.6, "track": "dialogue", "op": "line", "speaker": "pak_hamid", "th": "ระวังลื่นนะเด็กๆ ตลิ่งเปียก", "en": "Careful, kids, the bank is slippery." },
+    { "t": 18.4, "track": "actor", "op": "anim", "actor": "ton", "anim": "crouch", "dur": 2.4 },
+    { "t": 18.4, "track": "actor", "op": "anim", "actor": "fon", "anim": "crouch", "dur": 2.4 },
+    { "t": 19.0, "track": "fx", "op": "spawn", "fx": "krathong_glow", "at": [184, 134], "dur": 12 },
+    { "t": 19.3, "track": "fx", "op": "spawn", "fx": "krathong_glow", "at": [210, 138], "dur": 12 },
+    { "t": 19.0, "track": "audio", "op": "sfx", "sfx": "blip" },
+    { "t": 19.4, "track": "camera", "op": "zoom", "to": 1.6, "dur": 2 },
+    { "t": 19.4, "track": "camera", "op": "pan", "to": [200, 120], "dur": 2 },
+    { "t": 21.8, "track": "dialogue", "op": "line", "speaker": "fon", "th": "ขอให้ปีหน้าทุกคนในหมู่บ้านมีความสุขนะ", "en": "May everyone in the village be happy next year." },
+    { "t": 21.8, "track": "screen", "op": "wait_input", "dur": 0.5, "note": "game waits for a key press here" },
+    { "t": 25.0, "track": "camera", "op": "zoom", "to": 1, "dur": 2 },
+    { "t": 25.0, "track": "camera", "op": "pan", "to": [260, 80], "dur": 2 },
+    { "t": 25.0, "track": "fx", "op": "spawn", "fx": "khom_loi", "at": [330, 96], "dur": 7 },
+    { "t": 25.6, "track": "dialogue", "op": "line", "speaker": "pak_hamid", "th": "สวยจริงๆ ดูโคมลอยฝั่งโน้นสิ", "en": "Beautiful. Look at the sky lanterns across the river." },
+    { "t": 28.4, "track": "actor", "op": "anim", "actor": "ton", "anim": "wave", "dur": 1.6 },
+    { "t": 30.0, "track": "audio", "op": "music_stop", "fade": 2 },
+    { "t": 30.0, "track": "screen", "op": "fade", "to": 1, "dur": 2 }
+  ]
+}
